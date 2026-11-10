@@ -1,6 +1,2 @@
 -r requirements.txt
 pytest>=8.0
-   streamlit
-   pandas
-   openpyxl
-   plotly
