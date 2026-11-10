@@ -156,3 +156,75 @@ def check_merge(left: pd.DataFrame, right: pd.DataFrame, on, value_col: str, how
                     'of both tables before using this result.') if fan_out else '',
     }
     return merged, report
+
+
+
+
+# ------------------------------------------------ E-Presso data model
+# Each table is recognized by the columns it has (not by its file name),
+# so an updated file with a different name still works.
+TABLE_SIGNATURES = {
+    'sales': {'Sales ID', 'Date', 'Store ID', 'Revenue'},
+    'stores': {'ID', 'StoreType'},
+    'products': {'Product ID', 'Product'},
+    'categories': {'Category ID', 'Category'},
+    'survey': {'Survey ID', 'Satisfaction'},
+}
+
+
+def identify_table(df: pd.DataFrame):
+    """Return 'sales', 'stores', ... based on the columns, or None."""
+    cols = set(df.columns)
+    for name, needed in TABLE_SIGNATURES.items():
+        if needed.issubset(cols):
+            return name
+    return None
+
+
+def build_model(tables: dict):
+    """Join Sales (the main table) to its lookup tables one at a time, checking
+    after each join that revenue was not duplicated. The survey is NOT joined
+    here: it is yearly while Sales is monthly, so joining would repeat revenue.
+    Returns (model, report)."""
+    if 'sales' not in tables:
+        return None, {'steps': [], 'problems': ['No Sales table found. Please upload the Sales file.']}
+
+    model = tables['sales'].copy()
+    model['Revenue'] = pd.to_numeric(model['Revenue'], errors='coerce')
+    model['Date'] = pd.to_datetime(model['Date'], errors='coerce')
+    model['Year'] = model['Date'].dt.year
+    model['Month'] = model['Date'].dt.month
+
+    steps, problems = [], []
+    bad_revenue = int(model['Revenue'].isna().sum())
+    bad_dates = int(model['Date'].isna().sum())
+    if bad_revenue:
+        problems.append(f'{bad_revenue} Sales row(s) have a missing or non-numeric Revenue.')
+    if bad_dates:
+        problems.append(f'{bad_dates} Sales row(s) have a missing or invalid Date.')
+
+    # (table name, key in Sales, key in lookup table, a label column to test matches)
+    joins = [
+        ('stores', 'Store ID', 'ID', 'StoreType'),
+        ('products', 'Product ID', 'Product ID', 'Product'),
+        ('categories', 'Category ID', 'Category ID', 'Category'),
+    ]
+    for name, sales_key, lookup_key, label_col in joins:
+        if name not in tables:
+            problems.append(f'No {name} table uploaded, so its columns are missing.')
+            continue
+        lookup = tables[name].rename(columns={lookup_key: sales_key})
+        dup_keys = int(lookup[sales_key].duplicated().sum())
+        if dup_keys:
+            problems.append(f'{name}: {dup_keys} duplicate key(s). Joining would duplicate '
+                            f'revenue, so this table was skipped.')
+            continue
+        model, report = check_merge(model, lookup, on=sales_key, value_col='Revenue')
+        step = {'table': name, **report}
+        step['unmatched_rows'] = int(model[label_col].isna().sum())
+        steps.append(step)
+        if step['unmatched_rows']:
+            problems.append(f"{step['unmatched_rows']} Sales row(s) had no match in {name}.")
+        if report['changed']:
+            problems.append(f'{name}: {report["warning"]}')
+    return model, {'steps': steps, 'problems': problems}
