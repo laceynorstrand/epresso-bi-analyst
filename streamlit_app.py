@@ -1,5 +1,5 @@
-"""Main app. Checkpoint 0: loads a file and shows a profile.
-Keep calculations in analytics.py and the assistant in agent.py."""
+"""Main app. Keep calculations in analytics.py and the assistant in agent.py."""
+import pandas as pd
 import streamlit as st
 
 import agent
@@ -11,6 +11,7 @@ st.set_page_config(page_title='E-Presso BI Analyst', layout='wide')
 st.title('E-Presso BI Analyst')
 st.caption('Interactive business intelligence dashboard and analytical assistant for E-Presso.')
 
+
 @st.cache_data(show_spinner=False)
 def cached_load(file_bytes: bytes, filename: str, sheet_name):
     # The cache is keyed on the file CONTENTS, so a modified file is never
@@ -20,40 +21,77 @@ def cached_load(file_bytes: bytes, filename: str, sheet_name):
 
 with st.sidebar:
     st.header('Data')
-    uploaded = st.file_uploader('Upload a CSV or Excel file', type=['csv', 'txt', 'tsv', 'xlsx', 'xls'])
-    sheet = 0
-    if uploaded is not None and uploaded.name.lower().endswith(analytics.EXCEL_EXT):
-        sheet = st.selectbox('Sheet', analytics.excel_sheet_names(uploaded.getvalue()))
+    uploaded_files = st.file_uploader(
+        'Upload all E-Presso files (CSV or Excel)',
+        type=['csv', 'txt', 'tsv', 'xlsx', 'xls'],
+        accept_multiple_files=True,
+    )
 
-if uploaded is None:
-    st.info('Upload a file in the sidebar to begin.')
+if not uploaded_files:
+    st.info('Upload your E-Presso files in the sidebar to begin.')
     st.stop()
 
-try:
-    df = cached_load(uploaded.getvalue(), uploaded.name, sheet)
-except Exception as exc:  # show a readable message instead of a traceback
-    st.error(f'Could not read that file: {exc}')
+# Read every file and work out which table it is from its columns.
+tables = {}
+unrecognized = []
+for f in uploaded_files:
+    try:
+        table = cached_load(f.getvalue(), f.name, 0)
+    except Exception as exc:  # show a readable message instead of a traceback
+        st.sidebar.error(f'Could not read {f.name}: {exc}')
+        continue
+    kind = analytics.identify_table(table)
+    if kind is None:
+        unrecognized.append(f.name)
+    else:
+        tables[kind] = table
+
+st.sidebar.write('**Recognized tables:**')
+for kind, table in tables.items():
+    st.sidebar.write(f'{kind}: {len(table):,} rows')
+for name in unrecognized:
+    st.sidebar.warning(f'Not recognized: {name}')
+
+df, model_report = analytics.build_model(tables)
+if df is None:
+    st.error(model_report['problems'][0])
     st.stop()
 
 tab_data, tab_dash, tab_assistant = st.tabs(['Data and profile', 'Dashboard', 'Assistant'])
 
 with tab_data:
-    profile = analytics.profile_table(df)
+    choice = st.selectbox('Table to inspect', list(tables.keys()))
+    profile = analytics.profile_table(tables[choice])
     c1, c2, c3 = st.columns(3)
     c1.metric('Rows', f"{profile['rows']:,}")
     c2.metric('Columns', profile['columns'])
     c3.metric('Duplicate rows', profile['duplicate_rows'])
     st.subheader('Preview')
-    st.dataframe(df.head(50))
+    st.dataframe(tables[choice].head(50))
     left, right = st.columns(2)
     left.subheader('Missing values')
     left.dataframe(profile['missing'])
     right.subheader('Data types')
     right.dataframe(profile['dtypes'])
 
+    st.subheader('Join checks')
+    st.caption('After each join, rows and revenue should NOT change. If they do, a join duplicated revenue.')
+    if model_report['steps']:
+        st.dataframe(pd.DataFrame(model_report['steps']))
+    for problem in model_report['problems']:
+        st.warning(problem)
+
 with tab_dash:
-    st.info('TODO: KPIs, filters, and at least three charts go here. '
-            'Calculate everything from the loaded data. Never hardcode results.')
+    total = analytics.get_total(df, 'Revenue')
+    if total.error:
+        st.error(total.error)
+    else:
+        k1, k2, k3 = st.columns(3)
+        k1.metric('Total revenue', f'${total.value:,.0f}')
+        k2.metric('Sales rows used', f'{total.rows_used:,}')
+        k3.metric('Period', f"{df['Date'].min():%b %Y} to {df['Date'].max():%b %Y}")
+        st.caption(f'{total.definition}. Revenue is not profit.')
+    st.info('Charts and filters come in Lesson 3.')
 
 with tab_assistant:
     st.caption('Mode: rules-based starter. Describe what you actually built here.')
