@@ -1,5 +1,6 @@
 """Main app. Keep calculations in analytics.py and the assistant in agent.py."""
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 import agent
@@ -82,16 +83,78 @@ with tab_data:
         st.warning(problem)
 
 with tab_dash:
-    total = analytics.get_total(df, 'Revenue')
-    if total.error:
-        st.error(total.error)
+    st.subheader('Filters')
+    f1, f2, f3 = st.columns(3)
+
+    years = sorted(int(y) for y in df['Year'].dropna().unique())
+    sel_years = f1.multiselect('Year', years, default=years)
+
+    cats = sorted(df['Category'].dropna().unique()) if 'Category' in df.columns else []
+    sel_cats = f2.multiselect('Product category', cats, default=cats) if cats else []
+
+    types = sorted(df['StoreType'].dropna().unique()) if 'StoreType' in df.columns else []
+    sel_types = f3.multiselect('Sales channel', types, default=types) if types else []
+
+    # Apply filters. A filter only removes rows when something is deselected.
+    mask = df['Year'].isin(sel_years)
+    if cats and len(sel_cats) < len(cats):
+        mask &= df['Category'].isin(sel_cats)
+    if types and len(sel_types) < len(types):
+        mask &= df['StoreType'].isin(sel_types)
+    filtered = df[mask]
+
+    is_filtered = len(filtered) < len(df)
+    if is_filtered:
+        st.caption(f'Showing a FILTERED subset: {len(filtered):,} of {len(df):,} sales rows.')
     else:
+        st.caption('Showing ALL data (no filters removing rows).')
+
+    if filtered.empty:
+        st.warning('No rows match these filters. Select at least one value in each filter.')
+    else:
+        total = analytics.get_total(filtered, 'Revenue')
         k1, k2, k3 = st.columns(3)
         k1.metric('Total revenue', f'${total.value:,.0f}')
         k2.metric('Sales rows used', f'{total.rows_used:,}')
-        k3.metric('Period', f"{df['Date'].min():%b %Y} to {df['Date'].max():%b %Y}")
+        k3.metric('Period', f"{filtered['Date'].min():%b %Y} to {filtered['Date'].max():%b %Y}")
         st.caption(f'{total.definition}. Revenue is not profit.')
-    st.info('Charts and filters come in Lesson 3.')
+
+        def to_frame(result, label, numeric_sort=False):
+            if result.error:
+                st.error(result.error)
+                return None
+            items = list(result.value.items())
+            if numeric_sort:
+                items.sort(key=lambda kv: int(kv[0]))
+            return pd.DataFrame(items, columns=[label, 'Revenue'])
+
+        c1, c2 = st.columns(2)
+        by_year = to_frame(analytics.group_total(filtered, 'Revenue', 'Year'), 'Year', True)
+        if by_year is not None:
+            fig = px.bar(by_year, x='Year', y='Revenue', title='Revenue by year ($)')
+            fig.update_xaxes(type='category')
+            c1.plotly_chart(fig, use_container_width=True)
+
+        by_month = to_frame(analytics.group_total(filtered, 'Revenue', 'Month'), 'Month', True)
+        if by_month is not None:
+            fig = px.line(by_month, x='Month', y='Revenue', markers=True,
+                          title='Revenue by month, summed across selected years ($)')
+            fig.update_xaxes(dtick=1)
+            c2.plotly_chart(fig, use_container_width=True)
+
+        c3, c4 = st.columns(2)
+        if types:
+            by_type = to_frame(analytics.group_total(filtered, 'Revenue', 'StoreType'), 'Sales channel')
+            if by_type is not None:
+                c3.plotly_chart(px.bar(by_type, x='Sales channel', y='Revenue',
+                                       title='Revenue by sales channel ($)'),
+                                use_container_width=True)
+        if cats:
+            by_cat = to_frame(analytics.group_total(filtered, 'Revenue', 'Category'), 'Category')
+            if by_cat is not None:
+                c4.plotly_chart(px.bar(by_cat, x='Category', y='Revenue',
+                                       title='Revenue by product category ($)'),
+                                use_container_width=True)
 
 with tab_assistant:
     st.caption('Mode: rules-based starter. Describe what you actually built here.')
