@@ -9,8 +9,7 @@ MAX_QUESTIONS = 15  # per-session limit for the assistant
 
 st.set_page_config(page_title='E-Presso BI Analyst', layout='wide')
 st.title('E-Presso BI Analyst')
-st.caption('Starter app. Replace this line with a description of your own application.')
-
+st.caption('Interactive business intelligence dashboard and analytical assistant for E-Presso.')
 
 @st.cache_data(show_spinner=False)
 def cached_load(file_bytes: bytes, filename: str, sheet_name):
