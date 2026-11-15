@@ -1,4 +1,6 @@
-"""Main app. Keep calculations in analytics.py and the assistant in agent.py."""
+"""E-Presso BI Analyst. Calculations live in analytics.py, the assistant in agent.py."""
+from pathlib import Path
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -7,6 +9,7 @@ import agent
 import analytics
 
 MAX_QUESTIONS = 15  # per-session limit for the assistant
+DATA_DIR = Path(__file__).parent / 'data'
 
 st.set_page_config(page_title='E-Presso BI Analyst', layout='wide')
 st.title('E-Presso BI Analyst')
@@ -20,22 +23,39 @@ def cached_load(file_bytes: bytes, filename: str, sheet_name):
     return analytics.load_table(file_bytes, filename, sheet_name)
 
 
+@st.cache_data(show_spinner=False)
+def load_bundled():
+    """Read the sample E-Presso files stored in the repo's data/ folder."""
+    found = {}
+    if DATA_DIR.exists():
+        for path in sorted(DATA_DIR.iterdir()):
+            if path.suffix.lower() in analytics.TEXT_EXT + analytics.EXCEL_EXT:
+                try:
+                    table = analytics.load_table(path.read_bytes(), path.name, 0)
+                except Exception:
+                    continue
+                kind = analytics.identify_table(table)
+                if kind and kind not in found:
+                    found[kind] = (path.name, table)
+    return found
+
+
+# ------------------------------------------------------------------ data
+bundled = load_bundled()
 with st.sidebar:
     st.header('Data')
+    st.caption('The app starts with the bundled E-Presso sample data. Upload files to replace '
+               'any table (for example an updated Sales file). Tables are recognized by their columns.')
     uploaded_files = st.file_uploader(
-        'Upload all E-Presso files (CSV or Excel)',
+        'Upload E-Presso files (CSV or Excel)',
         type=['csv', 'txt', 'tsv', 'xlsx', 'xls'],
         accept_multiple_files=True,
     )
 
-if not uploaded_files:
-    st.info('Upload your E-Presso files in the sidebar to begin.')
-    st.stop()
-
-# Read every file and work out which table it is from its columns.
-tables = {}
+tables = {kind: table for kind, (_, table) in bundled.items()}
+source = {kind: f'bundled sample ({fname})' for kind, (fname, _) in bundled.items()}
 unrecognized = []
-for f in uploaded_files:
+for f in uploaded_files or []:
     try:
         table = cached_load(f.getvalue(), f.name, 0)
     except Exception as exc:  # show a readable message instead of a traceback
@@ -46,12 +66,17 @@ for f in uploaded_files:
         unrecognized.append(f.name)
     else:
         tables[kind] = table
+        source[kind] = f'UPLOADED ({f.name})'
 
-st.sidebar.write('**Recognized tables:**')
+st.sidebar.write('**Tables in use:**')
 for kind, table in tables.items():
-    st.sidebar.write(f'{kind}: {len(table):,} rows')
+    st.sidebar.write(f'{kind}: {len(table):,} rows, from {source[kind]}')
 for name in unrecognized:
     st.sidebar.warning(f'Not recognized: {name}')
+
+if 'sales' not in tables:
+    st.info('No Sales data found. Upload the Sales file in the sidebar to begin.')
+    st.stop()
 
 df, model_report = analytics.build_model(tables)
 if df is None:
@@ -60,6 +85,7 @@ if df is None:
 
 tab_data, tab_dash, tab_assistant = st.tabs(['Data and profile', 'Dashboard', 'Assistant'])
 
+# --------------------------------------------------------- data and profile
 with tab_data:
     choice = st.selectbox('Table to inspect', list(tables.keys()))
     profile = analytics.profile_table(tables[choice])
@@ -75,13 +101,29 @@ with tab_data:
     right.subheader('Data types')
     right.dataframe(profile['dtypes'])
 
+    st.subheader('Table relationships and grain')
+    st.markdown(
+        '- **Sales** (one row = one product\'s revenue for one month at one location) is the main table.\n'
+        '- Sales `Store ID` links to Stores `ID`; `Product ID` to Products; `Category ID` to Categories.\n'
+        '- **Survey** (one row = one satisfaction score for one store in one year) links through '
+        '`StoreYear` = `Survey ID`. It is yearly while Sales is monthly, so it is not joined into the revenue '
+        'table, to avoid repeating revenue.')
+
     st.subheader('Join checks')
     st.caption('After each join, rows and revenue should NOT change. If they do, a join duplicated revenue.')
     if model_report['steps']:
         st.dataframe(pd.DataFrame(model_report['steps']))
-    for problem in model_report['problems']:
-        st.warning(problem)
+    if model_report['problems']:
+        for problem in model_report['problems']:
+            st.warning(problem)
+    else:
+        st.success('No data problems found in the joins.')
 
+    quality = analytics.get_data_quality_report(tables, df)
+    with st.expander('Data quality report (all tables)'):
+        st.json(quality.value)
+
+# ---------------------------------------------------------------- dashboard
 with tab_dash:
     st.subheader('Filters')
     f1, f2, f3 = st.columns(3)
@@ -103,8 +145,7 @@ with tab_dash:
         mask &= df['StoreType'].isin(sel_types)
     filtered = df[mask]
 
-    is_filtered = len(filtered) < len(df)
-    if is_filtered:
+    if len(filtered) < len(df):
         st.caption(f'Showing a FILTERED subset: {len(filtered):,} of {len(df):,} sales rows.')
     else:
         st.caption('Showing ALL data (no filters removing rows).')
@@ -117,7 +158,16 @@ with tab_dash:
         k1.metric('Total revenue', f'${total.value:,.0f}')
         k2.metric('Sales rows used', f'{total.rows_used:,}')
         k3.metric('Period', f"{filtered['Date'].min():%b %Y} to {filtered['Date'].max():%b %Y}")
-        st.caption(f'{total.definition}. Revenue is not profit.')
+
+        by_channel = analytics.get_revenue_by_channel(filtered)
+        by_year_tool = analytics.get_revenue_by_year(filtered)
+        k4, k5 = st.columns(2)
+        if not by_channel.error and 'Website' in by_channel.value:
+            k4.metric('Website share of revenue', f"{by_channel.value['Website']['share_pct']:.1f}%")
+        growth = None if by_year_tool.error else by_year_tool.value['first_to_last_year_pct']
+        if growth is not None:
+            k5.metric('Revenue change, first to last year shown', f'{growth:+.1f}%')
+        st.caption(f'{total.definition}. Revenue is not profit. Metrics above use the filtered data.')
 
         def to_frame(result, label, numeric_sort=False):
             if result.error:
@@ -156,26 +206,33 @@ with tab_dash:
                                        title='Revenue by product category ($)'),
                                 use_container_width=True)
 
+# ---------------------------------------------------------------- assistant
 with tab_assistant:
-    st.caption('Mode: rules-based starter. Describe what you actually built here.')
+    st.caption('Mode: RULES-BASED assistant. It matches your question to an approved analytical function, '
+               'runs it on the currently loaded data, and reports the result. It is not a language model. '
+               'It answers about the full dataset; dashboard filters do not apply here.')
     st.session_state.setdefault('n_questions', 0)
     st.session_state.setdefault('history', [])
+    st.caption(f"Questions used this session: {st.session_state['n_questions']} of {MAX_QUESTIONS}")
     for item in st.session_state['history']:
         with st.chat_message('user'):
             st.write(item['question'])
         with st.chat_message('assistant'):
-            st.markdown(f"**Scope:** {item['answer']['scope']}")
-            st.markdown(f"**Findings:** {item['answer']['findings']}")
-            if item['answer']['interpretation']:
-                st.markdown(f"**Interpretation:** {item['answer']['interpretation']}")
+            ans = item['answer']
+            st.markdown(f"**Scope:** {ans['scope']}")
+            st.markdown(f"**Findings (calculated):**\n\n{ans['findings']}")
+            if ans['interpretation']:
+                st.markdown(f"**Interpretation (not a calculated fact):** {ans['interpretation']}")
+            if ans.get('limitations'):
+                st.markdown('**Limitations:**\n\n' + '\n'.join(f'- {c}' for c in ans['limitations']))
             with st.expander('Tool-call log'):
-                st.json(item['answer']['tool_log'])
+                st.json(ans['tool_log'])
     question = st.chat_input('Ask a question about the loaded data')
     if question:
         if st.session_state['n_questions'] >= MAX_QUESTIONS:
             st.warning('Question limit reached for this session. Reload the page to start over.')
         else:
             st.session_state['n_questions'] += 1
-            answer = agent.answer_question(question, df, mode='rules')
+            answer = agent.answer_question(question, df, mode='rules', tables=tables)
             st.session_state['history'].append({'question': question, 'answer': answer})
             st.rerun()

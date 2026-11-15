@@ -2,6 +2,7 @@
 tested on its own and reused by the assistant."""
 from __future__ import annotations
 
+import calendar
 import io
 from dataclasses import asdict, dataclass, field
 
@@ -158,8 +159,6 @@ def check_merge(left: pd.DataFrame, right: pd.DataFrame, on, value_col: str, how
     return merged, report
 
 
-
-
 # ------------------------------------------------ E-Presso data model
 # Each table is recognized by the columns it has (not by its file name),
 # so an updated file with a different name still works.
@@ -228,3 +227,263 @@ def build_model(tables: dict):
         if report['changed']:
             problems.append(f'{name}: {report["warning"]}')
     return model, {'steps': steps, 'problems': problems}
+
+
+# =====================================================================
+# E-Presso analytical tools (the ONLY calculations the assistant may use)
+# Every tool takes the joined model `df` from build_model and returns a ToolResult.
+# =====================================================================
+def _need(df: pd.DataFrame, tool: str, columns: list):
+    """Return an error ToolResult if the loaded data lacks a needed column."""
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        return _error(tool, f'The loaded data is missing column(s) {missing}. '
+                            f'Upload the file(s) that contain them.')
+    return None
+
+
+def _years(df: pd.DataFrame) -> list:
+    return sorted(int(y) for y in df['Year'].dropna().unique())
+
+
+def _pct(new, old):
+    """Percent change from old to new, or None when old is zero or missing."""
+    if old is None or pd.isna(old) or old == 0:
+        return None
+    return round(float((new - old) / old * 100), 2)
+
+
+def get_revenue_by_channel(df: pd.DataFrame, year: int | None = None) -> ToolResult:
+    """Website vs. Brick & Mortar revenue, optionally for one year."""
+    name = 'get_revenue_by_channel'
+    err = _need(df, name, ['Revenue', 'StoreType', 'Year'])
+    if err:
+        return err
+    subset = df
+    if year is not None:
+        year = int(year)
+        subset = df[df['Year'] == year]
+        if subset.empty:
+            return _error(name, f'No sales rows found for {year}. Years in the data: {_years(df)}',
+                          {'year': year})
+    clean = subset.dropna(subset=['Revenue', 'StoreType'])
+    by = clean.groupby('StoreType')['Revenue'].sum()
+    total = float(by.sum())
+    value = {str(k): {'revenue': float(v),
+                      'share_pct': round(float(v) / total * 100, 2) if total else None}
+             for k, v in by.items()}
+    caveats = ['Revenue is not profit. No cost data is available.']
+    excluded = len(subset) - len(clean)
+    if excluded:
+        caveats.append(f'{excluded} row(s) with missing revenue or sales channel were excluded.')
+    return ToolResult(tool=name, value=value,
+                      definition='Sum of Revenue by StoreType. share_pct = channel revenue / total revenue in scope.',
+                      scope={'year': year if year is not None else 'all years',
+                             'years_in_data': _years(df)},
+                      rows_used=len(clean), caveats=caveats)
+
+
+def get_revenue_by_year(df: pd.DataFrame, channel: str | None = None) -> ToolResult:
+    """Revenue for each year, with the change from the prior year."""
+    name = 'get_revenue_by_year'
+    needed = ['Revenue', 'Year'] + (['StoreType'] if channel else [])
+    err = _need(df, name, needed)
+    if err:
+        return err
+    subset = df
+    if channel:
+        valid = sorted(map(str, df['StoreType'].dropna().unique()))
+        if channel not in valid:
+            return _error(name, f'Unknown channel {channel!r}. Valid channels: {valid}')
+        subset = df[df['StoreType'] == channel]
+    clean = subset.dropna(subset=['Revenue', 'Year'])
+    by = clean.groupby('Year')['Revenue'].sum().sort_index()
+    rows, prior = [], None
+    for y, v in by.items():
+        rows.append({'year': int(y), 'revenue': float(v), 'change_vs_prior_year_pct': _pct(v, prior)})
+        prior = v
+    first_last = _pct(by.iloc[-1], by.iloc[0]) if len(by) > 1 else None
+    return ToolResult(tool=name, value={'by_year': rows, 'first_to_last_year_pct': first_last},
+                      definition='Sum of Revenue by calendar year of the sale date.',
+                      scope={'channel': channel or 'all channels'},
+                      rows_used=len(clean),
+                      caveats=['Revenue is not profit. No cost data is available.'])
+
+
+def get_channel_growth(df: pd.DataFrame) -> ToolResult:
+    """Revenue growth for each sales channel from the first to the last year."""
+    name = 'get_channel_growth'
+    err = _need(df, name, ['Revenue', 'StoreType', 'Year'])
+    if err:
+        return err
+    clean = df.dropna(subset=['Revenue', 'StoreType', 'Year'])
+    pivot = clean.groupby(['StoreType', 'Year'])['Revenue'].sum().unstack('Year').fillna(0)
+    years = sorted(int(y) for y in pivot.columns)
+    if len(years) < 2:
+        return _error(name, 'At least two years of data are needed to measure growth.')
+    first, last = years[0], years[-1]
+    channels = {}
+    for ch, row in pivot.iterrows():
+        a, b = float(row[first]), float(row[last])
+        channels[str(ch)] = {'first_year_revenue': a, 'last_year_revenue': b,
+                             'dollar_change': b - a, 'pct_change': _pct(b, a)}
+    with_pct = {k: v for k, v in channels.items() if v['pct_change'] is not None}
+    best_pct = max(with_pct, key=lambda k: with_pct[k]['pct_change']) if with_pct else None
+    best_dollar = max(channels, key=lambda k: channels[k]['dollar_change'])
+    return ToolResult(tool=name,
+                      value={'first_year': first, 'last_year': last, 'channels': channels,
+                             'greatest_pct_growth': best_pct, 'greatest_dollar_growth': best_dollar},
+                      definition='Change in annual revenue per channel between the first and last year in the data.',
+                      scope={'years': f'{first} to {last}', 'channel': 'all channels'},
+                      rows_used=len(clean),
+                      caveats=['Growth compares only two years and ignores the years between them.',
+                               'Revenue is not profit. No cost data is available.'])
+
+
+def get_store_trend(df: pd.DataFrame) -> ToolResult:
+    """Revenue change per location (store or website) from the first to the last year."""
+    name = 'get_store_trend'
+    err = _need(df, name, ['Revenue', 'Year', 'Store ID'])
+    if err:
+        return err
+    d = df.dropna(subset=['Revenue', 'Year']).copy()
+    city = d['City'].astype('object').where(d['City'].notna(), 'Website') if 'City' in d.columns else 'Store'
+    d['Location'] = d['Store ID'].astype(str) + ' - ' + city
+    pivot = d.groupby(['Location', 'Year'])['Revenue'].sum().unstack('Year').fillna(0)
+    years = sorted(int(y) for y in pivot.columns)
+    if len(years) < 2:
+        return _error(name, 'At least two years of data are needed to measure a trend.')
+    first, last = years[0], years[-1]
+    rows = []
+    for loc, row in pivot.iterrows():
+        a, b = float(row[first]), float(row[last])
+        rows.append({'location': str(loc), 'first_year_revenue': a, 'last_year_revenue': b,
+                     'dollar_change': b - a, 'pct_change': _pct(b, a)})
+    rows.sort(key=lambda r: (r['pct_change'] is None, r['pct_change']))
+    declined = [r['location'] for r in rows if r['pct_change'] is not None and r['pct_change'] < 0]
+    return ToolResult(tool=name,
+                      value={'first_year': first, 'last_year': last,
+                             'locations_sorted_lowest_growth_first': rows,
+                             'locations_that_declined': declined},
+                      definition='Change in annual revenue per location between the first and last year, sorted from lowest to highest percent change.',
+                      scope={'years': f'{first} to {last}', 'locations': len(rows)},
+                      rows_used=len(d),
+                      caveats=['Compares only the first and last year.',
+                               'Revenue trends do not show store profitability. Costs, leases and staffing are not in the data.'])
+
+
+def get_category_performance(df: pd.DataFrame, year: int | None = None) -> ToolResult:
+    """Revenue and share of total by product category."""
+    name = 'get_category_performance'
+    err = _need(df, name, ['Revenue', 'Category', 'Year'])
+    if err:
+        return err
+    subset = df
+    if year is not None:
+        year = int(year)
+        subset = df[df['Year'] == year]
+        if subset.empty:
+            return _error(name, f'No sales rows found for {year}. Years in the data: {_years(df)}',
+                          {'year': year})
+    clean = subset.dropna(subset=['Revenue', 'Category'])
+    by = clean.groupby('Category')['Revenue'].sum().sort_values(ascending=False)
+    total = float(by.sum())
+    value = {str(k): {'revenue': float(v),
+                      'share_pct': round(float(v) / total * 100, 2) if total else None}
+             for k, v in by.items()}
+    return ToolResult(tool=name, value=value,
+                      definition='Sum of Revenue by product category. share_pct = category revenue / total revenue in scope.',
+                      scope={'year': year if year is not None else 'all years'},
+                      rows_used=len(clean),
+                      caveats=['Revenue is not profit. Categories may have very different costs and margins.'])
+
+
+def get_monthly_revenue_share(df: pd.DataFrame, year: int | None = None) -> ToolResult:
+    """Each month's revenue as a percentage of the annual total."""
+    name = 'get_monthly_revenue_share'
+    err = _need(df, name, ['Revenue', 'Year', 'Month'])
+    if err:
+        return err
+    d = df.dropna(subset=['Revenue', 'Year', 'Month'])
+    if year is not None:
+        year = int(year)
+        d = d[d['Year'] == year]
+        if d.empty:
+            return _error(name, f'No sales rows found for {year}. Years in the data: {_years(df)}',
+                          {'year': year})
+        by = d.groupby('Month')['Revenue'].sum()
+        share = by / by.sum() * 100
+        basis = f'Each month as a percentage of {year} total revenue.'
+        extra = {}
+    else:
+        per = d.groupby(['Year', 'Month'])['Revenue'].sum().unstack('Month').fillna(0)
+        share = per.div(per.sum(axis=1), axis=0).mean(axis=0) * 100
+        grand = d.groupby('Month')['Revenue'].sum()
+        grand_share = grand / grand.sum() * 100
+        basis = ("Each month as a percentage of ITS OWN YEAR's revenue, averaged across the years.")
+        extra = {'pct_of_five_year_total': {calendar.month_name[int(m)]: round(float(s), 2)
+                                           for m, s in grand_share.items()}}
+    share_named = {calendar.month_name[int(m)]: round(float(s), 2) for m, s in share.items()}
+    peak = max(share_named, key=share_named.get)
+    low = min(share_named, key=share_named.get)
+    value = {'basis': basis, 'share_pct': share_named, 'peak_month': peak, 'lowest_month': low, **extra}
+    return ToolResult(tool=name, value=value, definition=basis,
+                      scope={'year': year if year is not None else 'all years'},
+                      rows_used=len(d),
+                      caveats=['Monthly share shows seasonality, not profitability.'])
+
+
+def get_satisfaction_association(df: pd.DataFrame, tables: dict) -> ToolResult:
+    """Correlation between store-year customer satisfaction and store-year revenue."""
+    name = 'get_satisfaction_association'
+    survey = tables.get('survey') if tables else None
+    if survey is None:
+        return _error(name, 'No survey table is loaded, so satisfaction cannot be analyzed.')
+    err = _need(df, name, ['Revenue', 'StoreYear'])
+    if err:
+        return err
+    rev = df.groupby('StoreYear')['Revenue'].sum().rename('Revenue').reset_index()
+    merged = survey.merge(rev, left_on='Survey ID', right_on='StoreYear', how='inner')
+    merged['Satisfaction'] = pd.to_numeric(merged['Satisfaction'], errors='coerce')
+    usable = merged.dropna(subset=['Satisfaction', 'Revenue'])
+    n_missing = int(merged['Satisfaction'].isna().sum())
+    if len(usable) < 8:
+        return _error(name, f'Only {len(usable)} store-years have both satisfaction and revenue. '
+                            f'That is too few for a reliable comparison.')
+    r = float(usable['Satisfaction'].corr(usable['Revenue']))
+    value = {'store_years_compared': int(len(usable)),
+             'store_years_missing_satisfaction': n_missing,
+             'correlation': round(r, 3),
+             'average_satisfaction': round(float(usable['Satisfaction'].mean()), 2)}
+    return ToolResult(tool=name, value=value,
+                      definition='Pearson correlation between yearly satisfaction score and yearly revenue, one point per store-year.',
+                      scope={'unit': 'store-years with a satisfaction score'},
+                      rows_used=int(len(usable)),
+                      caveats=['Correlation is an association. It does not show that satisfaction causes revenue, or the reverse.',
+                               'Larger stores may differ in both satisfaction and revenue, which this simple comparison does not control for.',
+                               'The Website has no satisfaction scores, so it is not included.',
+                               'Survey responses may not represent all customers.'])
+
+
+def get_data_quality_report(tables: dict, df: pd.DataFrame | None = None) -> ToolResult:
+    """Rows, duplicates and missing values for every loaded table."""
+    name = 'get_data_quality_report'
+    if not tables:
+        return _error(name, 'No tables are loaded.')
+    value = {}
+    for kind, t in tables.items():
+        missing = {c: int(n) for c, n in t.isna().sum().items() if n > 0}
+        value[kind] = {'rows': int(len(t)), 'duplicate_rows': int(t.duplicated().sum()),
+                       'columns_with_missing_values': missing}
+    caveats = []
+    if 'sales' in tables and 'Sales ID' in tables['sales'].columns:
+        dup_ids = int(tables['sales']['Sales ID'].duplicated().sum())
+        value['sales']['duplicate_sales_ids'] = dup_ids
+    if df is not None and 'Revenue' in df.columns:
+        value['sales']['missing_or_non_numeric_revenue'] = int(df['Revenue'].isna().sum())
+    if any(v['columns_with_missing_values'] for v in value.values()):
+        caveats.append('Missing values limit conclusions drawn from those columns.')
+    return ToolResult(tool=name, value=value,
+                      definition='Row counts, duplicate rows and missing values for each loaded table.',
+                      scope={'tables': list(tables)},
+                      rows_used=sum(v['rows'] for v in value.values()), caveats=caveats)
