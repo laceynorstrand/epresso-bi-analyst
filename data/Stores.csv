@@ -1,0 +1,22 @@
+ID,City,State,PostalCode,StoreType,Market,Location
+SH00,,,,Website,5-Global,Website
+SH01,Orlando,FL,32822,Brick & Mortar,3-Medium,South
+SH02,Silver Spring,MD,20904,Brick & Mortar,1-Small,East
+SH03,Boulder,CO,80301,Brick & Mortar,2-Minor,West
+SH04,Greenville,NC,27834,Brick & Mortar,1-Small,East
+SH05,Santa Fe,NM,87507,Brick & Mortar,1-Small,Southwest
+SH06,Columbus,OH,43207,Brick & Mortar,2-Minor,Midwest
+SH07,Flushing,NY,11355,Brick & Mortar,2-Minor,Southwest
+SH08,Orlando,FL,32789,Brick & Mortar,1-Small,East
+SH09,Phoenix,AZ,85010,Brick & Mortar,4-Large,Southwest
+SH10,Decatur,GA,30034,Brick & Mortar,2-Minor,South
+SH11,Chicago,IL,60616,Brick & Mortar,4-Large,Midwest
+SH12,Baton Rouge,LA,70816,Brick & Mortar,3-Medium,South
+SH13,Denver,CO,80229,Brick & Mortar,3-Medium,West
+SH14,Portland,OR,97202,Brick & Mortar,3-Medium,West
+SH15,Baltimore,MD,21224,Brick & Mortar,4-Large,East
+SH16,Omaha,NE,68022,Brick & Mortar,2-Minor,Midwest
+SH17,East Lansing,MI,48823,Brick & Mortar,1-Small,Midwest
+SH18,Seattle,WA,98105,Brick & Mortar,3-Medium,West
+SH19,Raleigh,NC,27613,Brick & Mortar,2-Minor,South
+SH20,Tempe,AZ,85281,Brick & Mortar,1-Small,Southwest
